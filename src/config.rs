@@ -1,5 +1,6 @@
 use std::env;
 
+#[derive(Debug, Clone)]
 pub struct Config {
     pub redis_url: String,
     pub mongo_url: String,
