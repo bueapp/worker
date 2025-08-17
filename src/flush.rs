@@ -21,6 +21,7 @@ where
         .await?;
 
     if logs.is_empty() {
+        tracing::debug!("No logs found in Redis for {}", redis_key);
         return Ok(0);
     }
 
