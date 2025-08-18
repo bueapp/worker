@@ -13,6 +13,8 @@ use redis::aio::MultiplexedConnection;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info};
 
+use crate::models::JoinLog;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -29,9 +31,11 @@ async fn main() -> Result<()> {
 
     let events_collection: Collection<Document> = db.collection("events");
     let guardian_collection: Collection<Document> = db.collection("guardianLogs");
+    let join_collection: Collection<Document> = db.collection("joinLogs");
 
     // ttl indexing
-    ttl_index::ensure_ttl_indexes(&events_collection, &guardian_collection).await?;
+    ttl_index::ensure_ttl_indexes(&events_collection, &guardian_collection, &join_collection)
+        .await?;
 
     info!(
         "🚀 Log worker started with batch={} interval={}s",
@@ -39,8 +43,8 @@ async fn main() -> Result<()> {
     );
 
     tokio::select! {
-        _ = worker_loop(redis_conn.clone(), events_collection.clone(), guardian_collection.clone(), cfg.clone()) => {},
-        _ = shutdown_signal(redis_conn.clone(), events_collection.clone(), guardian_collection.clone(), cfg.clone()) => {},
+        _ = worker_loop(redis_conn.clone(), events_collection.clone(), guardian_collection.clone(),join_collection.clone(), cfg.clone()) => {},
+        _ = shutdown_signal(redis_conn.clone(), events_collection.clone(), guardian_collection.clone(),join_collection.clone(), cfg.clone()) => {},
     }
 
     Ok(())
@@ -50,13 +54,15 @@ async fn worker_loop(
     redis_conn: MultiplexedConnection,
     events_collection: mongodb::Collection<EventLog>,
     guardian_collection: mongodb::Collection<GuardianLog>,
+    join_collection: mongodb::Collection<JoinLog>,
     cfg: Config,
 ) {
     loop {
         let mut conn1 = redis_conn.clone();
         let mut conn2 = redis_conn.clone();
+        let mut conn3 = redis_conn.clone();
 
-        let (events_res, guardian_res) = tokio::join!(
+        let (events_res, guardian_res, join_res) = tokio::join!(
             flush_logs(
                 &mut conn1,
                 &events_collection,
@@ -68,7 +74,8 @@ async fn worker_loop(
                 &guardian_collection,
                 "logs:guardian",
                 cfg.batch_size
-            )
+            ),
+            flush_logs(&mut conn3, &join_collection, "logs:join", cfg.batch_size)
         );
 
         if let Ok(count) = events_res {
@@ -87,6 +94,14 @@ async fn worker_loop(
             error!("❌ Error flushing guardian logs: {:?}", e);
         }
 
+        if let Ok(count) = join_res {
+            if count > 0 {
+                info!("✅ Flushed {} join logs", count);
+            }
+        } else if let Err(e) = join_res {
+            error!("❌ Error flushing join logs: {:?}", e);
+        }
+
         sleep(Duration::from_secs(cfg.flush_interval)).await;
     }
 }
@@ -95,6 +110,7 @@ async fn shutdown_signal(
     mut redis_conn: MultiplexedConnection,
     events_collection: mongodb::Collection<EventLog>,
     guardian_collection: mongodb::Collection<GuardianLog>,
+    join_collection: mongodb::Collection<JoinLog>,
     cfg: Config,
 ) {
     tokio::signal::ctrl_c()
@@ -124,6 +140,19 @@ async fn shutdown_signal(
     {
         if count > 0 {
             info!("Flushed {} guardian logs on shutdown", count);
+        }
+    }
+
+    if let Ok(count) = flush_logs(
+        &mut redis_conn,
+        &join_collection,
+        "logs:join",
+        cfg.batch_size,
+    )
+    .await
+    {
+        if count > 0 {
+            info!("Flushed {} join logs on shutdown", count);
         }
     }
 
