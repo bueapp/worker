@@ -1,18 +1,15 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use bson::spec::BinarySubtype;
-use bson::{Binary, Document, doc};
+use bson::Document;
 use mongodb::Collection;
 use redis::aio::MultiplexedConnection;
-use std::io::Cursor;
-use zstd::encode_all;
 
 pub async fn flush_logs(
     redis_conn: &mut MultiplexedConnection,
     collection: &Collection<Document>,
     redis_key: &str,
     batch_size: usize,
-) -> anyhow::Result<usize> {
+) -> Result<usize, anyhow::Error> {
     let logs: Vec<String> = redis::cmd("LRANGE")
         .arg(redis_key)
         .arg(0)
@@ -31,25 +28,15 @@ pub async fn flush_logs(
         .query_async::<()>(redis_conn)
         .await?;
 
-    let mut parsed_logs: Vec<Document> = Vec::new();
-
-    for s in logs {
-        if let Ok(bytes) = BASE64.decode(s) {
-            if let Ok(doc) = bson::from_slice::<Document>(&bytes) {
-                if let Ok(serialized) = bson::to_vec(&doc) {
-                    if let Ok(compressed) = encode_all(Cursor::new(serialized), 3) {
-                        parsed_logs.push(doc! {
-                            "compressed": Binary {
-                                subtype: BinarySubtype::Generic,
-                                bytes: compressed
-                            },
-                            "ts": chrono::Utc::now().timestamp_millis()
-                        });
-                    }
-                }
-            }
-        }
-    }
+    let parsed_logs: Vec<Document> = logs
+        .into_iter()
+        .filter_map(|s| {
+            BASE64
+                .decode(s)
+                .ok()
+                .and_then(|bytes| bson::from_slice::<Document>(&bytes).ok())
+        })
+        .collect();
 
     if parsed_logs.is_empty() {
         return Ok(0);
