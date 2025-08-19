@@ -1,7 +1,9 @@
 mod config;
+mod dlq;
 mod flush;
 mod models;
 mod ttl_index;
+mod tuning;
 
 use anyhow::Result;
 use bson::Document;
@@ -10,10 +12,10 @@ use flush::flush_logs;
 use models::{EventLog, GuardianLog};
 use mongodb::{Client, Collection, options::ClientOptions};
 use redis::aio::MultiplexedConnection;
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 use tracing::{error, info};
 
-use crate::models::JoinLog;
+use crate::{dlq::dlq_reprocessor, models::JoinLog, tuning::adjust_tuning};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -42,6 +44,14 @@ async fn main() -> Result<()> {
         cfg.batch_size, cfg.flush_interval
     );
 
+    let dlq_conn = redis_conn.clone();
+    let dlq_collection = events_collection.clone(); // or a dedicated "failed" collection
+    tokio::spawn(async move {
+        if let Err(e) = dlq_reprocessor(dlq_conn, dlq_collection, cfg.batch_size).await {
+            error!("❌ DLQ reprocessor stopped: {:?}", e);
+        }
+    });
+
     tokio::select! {
         _ = worker_loop(redis_conn.clone(), events_collection.clone(), guardian_collection.clone(),join_collection.clone(), cfg.clone()) => {},
         _ = shutdown_signal(redis_conn.clone(), events_collection.clone(), guardian_collection.clone(),join_collection.clone(), cfg.clone()) => {},
@@ -61,48 +71,64 @@ async fn worker_loop(
         let mut conn1 = redis_conn.clone();
         let mut conn2 = redis_conn.clone();
         let mut conn3 = redis_conn.clone();
+        let mut conn4 = redis_conn.clone();
+
+        let mut cmd_events = redis::cmd("LLEN");
+        cmd_events.arg("logs:events");
+
+        let mut cmd_guardian = redis::cmd("LLEN");
+        cmd_guardian.arg("logs:guardian");
+
+        let mut cmd_join = redis::cmd("LLEN");
+        cmd_join.arg("logs:join");
+
+        let (events_len, guardian_len, join_len) = tokio::join!(
+            cmd_events.query_async::<usize>(&mut conn3),
+            cmd_guardian.query_async::<usize>(&mut conn4),
+            cmd_join.query_async::<usize>(&mut conn2)
+        );
+
+        let total_queue =
+            events_len.unwrap_or(0) + guardian_len.unwrap_or(0) + join_len.unwrap_or(0);
+
+        let (batch_size, interval) = adjust_tuning(total_queue, cfg.batch_size, cfg.flush_interval);
 
         let (events_res, guardian_res, join_res) = tokio::join!(
-            flush_logs(
-                &mut conn1,
-                &events_collection,
-                "logs:events",
-                cfg.batch_size
-            ),
+            flush_logs(&mut conn1, &events_collection, "logs:events", batch_size),
             flush_logs(
                 &mut conn2,
                 &guardian_collection,
                 "logs:guardian",
-                cfg.batch_size
+                batch_size
             ),
-            flush_logs(&mut conn3, &join_collection, "logs:join", cfg.batch_size)
+            flush_logs(&mut conn3, &join_collection, "logs:join", batch_size)
         );
 
-        if let Ok(count) = events_res {
-            if count > 0 {
-                info!("✅ Flushed {} event logs", count);
+        match events_res {
+            Ok(count) if count > 0 => {
+                tracing::info!(count, batch_size, interval, "✅ Flushed event logs")
             }
-        } else if let Err(e) = events_res {
-            error!("❌ Error flushing events: {:?}", e);
+            Ok(_) => {}
+            Err(e) => tracing::error!(error=?e, "❌ Error flushing events"),
         }
 
-        if let Ok(count) = guardian_res {
-            if count > 0 {
-                info!("✅ Flushed {} guardian logs", count);
+        match guardian_res {
+            Ok(count) if count > 0 => {
+                tracing::info!(count, batch_size, interval, "✅ Flushed guardian logs")
             }
-        } else if let Err(e) = guardian_res {
-            error!("❌ Error flushing guardian logs: {:?}", e);
+            Ok(_) => {}
+            Err(e) => tracing::error!(error=?e, "❌ Error flushing guardian logs"),
         }
 
-        if let Ok(count) = join_res {
-            if count > 0 {
-                info!("✅ Flushed {} join logs", count);
+        match join_res {
+            Ok(count) if count > 0 => {
+                tracing::info!(count, batch_size, interval, "✅ Flushed join logs")
             }
-        } else if let Err(e) = join_res {
-            error!("❌ Error flushing join logs: {:?}", e);
+            Ok(_) => {}
+            Err(e) => tracing::error!(error=?e, "❌ Error flushing join logs"),
         }
 
-        sleep(Duration::from_secs(cfg.flush_interval)).await;
+        tokio::time::sleep(Duration::from_secs(interval)).await;
     }
 }
 
