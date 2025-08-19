@@ -16,7 +16,7 @@ WORKDIR /usr/src/app
 COPY . .
 
 # Build statically linked binary
-RUN cargo build --release --target x86_64-unknown-linux-musl
+RUN cargo +nightly build -Z build-std=std,panic_abort --target x86_64-unknown-linux-musl --release
 
 # Final minimal runtime image
 FROM debian:bullseye-slim
